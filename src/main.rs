@@ -1,5 +1,4 @@
 use std::f32::consts::PI;
-use std::thread;
 
 use bevy::prelude::*;
 use cpal::Sample;
@@ -31,6 +30,7 @@ fn main() {
         }))
         .add_systems(Startup, setup)
         .add_systems(Update, (drain_audio, update_bars))
+        .add_systems(PostUpdate, check_audio_status)
         .run();
 }
 
@@ -47,6 +47,20 @@ struct AudioSpectrum {
     spectrum: Vec<f32>,
     stream_status: String,
 }
+
+// Resource to hold the audio stream (keeps it alive)
+// cpal::Stream is intentionally not Send + Sync, but we need it to be a Resource.
+// Safety: The stream is only accessed by cpal's internal audio callbacks running on
+// a dedicated thread pool. Bevy never moves or accesses it directly; it only holds the
+// reference to keep it alive. The stream is safely dropped when this resource is dropped.
+#[derive(Resource)]
+struct AudioStream {
+    _stream: Option<cpal::Stream>,
+}
+
+// Safety: See comment above. The stream manages its own thread safety internally.
+unsafe impl Send for AudioStream {}
+unsafe impl Sync for AudioStream {}
 
 fn setup(mut commands: Commands, mut spectrum: ResMut<AudioSpectrum>) {
     commands.spawn(Camera2d);
@@ -66,56 +80,55 @@ fn setup(mut commands: Commands, mut spectrum: ResMut<AudioSpectrum>) {
 
     let (sender, receiver) = unbounded::<Vec<f32>>();
     spectrum.receiver = Some(receiver);
-    spectrum.stream_status = "starting microphone...".into();
-    spawn_audio_thread(sender);
+    spectrum.stream_status = "initializing audio...".into();
+
+    match initialize_audio_stream(sender) {
+        Ok(stream) => {
+            commands.insert_resource(AudioStream {
+                _stream: Some(stream),
+            });
+        }
+        Err(e) => {
+            spectrum.stream_status = format!("error: {}", e);
+            eprintln!("Failed to initialize audio: {}", e);
+        }
+    }
 }
 
-fn spawn_audio_thread(sender: Sender<Vec<f32>>) {
-    thread::spawn(move || {
-        let host = cpal::default_host();
-        let Some(device) = host.default_input_device() else {
-            eprintln!("No input device available");
-            return;
-        };
+fn initialize_audio_stream(sender: Sender<Vec<f32>>) -> Result<cpal::Stream, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or("No input device available")?;
 
-        let Ok(config) = device.default_input_config() else {
-            eprintln!("Failed to read default input config");
-            return;
-        };
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("Failed to read input config: {}", e))?;
 
-        let channels = config.channels() as usize;
-        let stream_config: cpal::StreamConfig = config.clone().into();
+    let channels = config.channels() as usize;
+    let stream_config: cpal::StreamConfig = config.clone().into();
 
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => {
-                build_stream::<f32>(&device, &stream_config, channels, sender)
-            }
-            cpal::SampleFormat::I16 => {
-                build_stream::<i16>(&device, &stream_config, channels, sender)
-            }
-            cpal::SampleFormat::U16 => {
-                build_stream::<u16>(&device, &stream_config, channels, sender)
-            }
-            sample_format => {
-                eprintln!("Unsupported sample format: {sample_format:?}");
-                return;
-            }
-        };
-
-        let Ok(stream) = stream else {
-            eprintln!("Failed to build input stream");
-            return;
-        };
-
-        if let Err(error) = stream.play() {
-            eprintln!("Failed to start input stream: {error}");
-            return;
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => {
+            build_stream::<f32>(&device, &stream_config, channels, sender)
         }
-
-        loop {
-            thread::park();
+        cpal::SampleFormat::I16 => {
+            build_stream::<i16>(&device, &stream_config, channels, sender)
         }
-    });
+        cpal::SampleFormat::U16 => {
+            build_stream::<u16>(&device, &stream_config, channels, sender)
+        }
+        sample_format => {
+            return Err(format!("Unsupported sample format: {:?}", sample_format));
+        }
+    }
+    .map_err(|e| format!("Failed to build stream: {}", e))?;
+
+    stream
+        .play()
+        .map_err(|e| format!("Failed to start stream: {}", e))?;
+
+    Ok(stream)
 }
 
 fn build_stream<T>(
@@ -227,5 +240,11 @@ fn update_bars(
         sprite.color = Color::srgb(0.12 + level * 0.85, 0.45 + level * 0.4, 0.85 - level * 0.45);
         transform.translation.x = bar.x;
         transform.translation.y = -WINDOW_HEIGHT / 2.0 + BOTTOM_MARGIN + height / 2.0;
+    }
+}
+
+fn check_audio_status(audio_stream: Option<Res<AudioStream>>, mut spectrum: ResMut<AudioSpectrum>) {
+    if audio_stream.is_some() && spectrum.stream_status == "initializing audio..." {
+        spectrum.stream_status = "mic live".into();
     }
 }
