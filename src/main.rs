@@ -18,7 +18,13 @@ const BOTTOM_MARGIN: f32 = 34.0;
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.03, 0.04, 0.07)))
-        .insert_resource(AudioSpectrum::default())
+        .insert_resource(AudioSpectrum {
+            receiver: None,
+            samples: Vec::new(),
+            spectrum: Vec::new(),
+            stream_status: String::new(),
+        })
+        .insert_resource(FftProcessor::new())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Mic Frequency Visualizer".into(),
@@ -40,12 +46,35 @@ struct FrequencyBar {
     x: f32,
 }
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 struct AudioSpectrum {
     receiver: Option<Receiver<Vec<f32>>>,
     samples: Vec<f32>,
     spectrum: Vec<f32>,
     stream_status: String,
+}
+
+#[derive(Resource)]
+struct FftProcessor {
+    planner: FftPlanner<f32>,
+    window: Vec<f32>,
+    buffer: Vec<Complex<f32>>,
+}
+
+impl FftProcessor {
+    fn new() -> Self {
+        // Precompute Hann window
+        let mut window = vec![0.0; FFT_SIZE];
+        for i in 0..FFT_SIZE {
+            window[i] = 0.5 - 0.5 * (2.0 * PI * i as f32 / (FFT_SIZE as f32 - 1.0)).cos();
+        }
+
+        Self {
+            planner: FftPlanner::new(),
+            window,
+            buffer: vec![Complex::new(0.0, 0.0); FFT_SIZE],
+        }
+    }
 }
 
 // Resource to hold the audio stream (keeps it alive)
@@ -163,7 +192,7 @@ where
     )
 }
 
-fn drain_audio(mut spectrum: ResMut<AudioSpectrum>) {
+fn drain_audio(mut spectrum: ResMut<AudioSpectrum>, mut fft: ResMut<FftProcessor>) {
     let Some(receiver) = spectrum.receiver.as_ref().cloned() else {
         return;
     };
@@ -181,24 +210,22 @@ fn drain_audio(mut spectrum: ResMut<AudioSpectrum>) {
         return;
     }
 
-    spectrum.spectrum = analyze_spectrum(&spectrum.samples[spectrum.samples.len() - FFT_SIZE..]);
+    spectrum.spectrum = analyze_spectrum(
+        &spectrum.samples[spectrum.samples.len() - FFT_SIZE..],
+        &mut fft,
+    );
     spectrum.stream_status = "mic live".into();
 }
 
-fn analyze_spectrum(samples: &[f32]) -> Vec<f32> {
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(FFT_SIZE);
+fn analyze_spectrum(samples: &[f32], fft_processor: &mut FftProcessor) -> Vec<f32> {
+    let fft = fft_processor.planner.plan_fft_forward(FFT_SIZE);
 
-    let mut buffer: Vec<Complex<f32>> = samples
-        .iter()
-        .enumerate()
-        .map(|(index, sample)| {
-            let window = 0.5 - 0.5 * (2.0 * PI * index as f32 / (FFT_SIZE as f32 - 1.0)).cos();
-            Complex::new(sample * window, 0.0)
-        })
-        .collect();
+    // Reuse buffer and apply windowing
+    for (i, sample) in samples.iter().enumerate() {
+        fft_processor.buffer[i] = Complex::new(sample * fft_processor.window[i], 0.0);
+    }
 
-    fft.process(&mut buffer);
+    fft.process(&mut fft_processor.buffer);
 
     let half = FFT_SIZE / 2;
     let bins_per_bar = half as f32 / BAR_COUNT as f32;
@@ -213,7 +240,7 @@ fn analyze_spectrum(samples: &[f32]) -> Vec<f32> {
         let mut count = 0;
 
         for bin in start..clamped_end {
-            total += buffer[bin].norm();
+            total += fft_processor.buffer[bin].norm();
             count += 1;
         }
 
