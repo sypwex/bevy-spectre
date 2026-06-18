@@ -1,0 +1,32 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"actionButtons": {
+			"commands": [{
+				"useVsCodeApi": false,
+				"singleInstance": true,
+				"command": "cargo build",
+				"name": "bld"
+			}, {
+				"useVsCodeApi": false,
+				"singleInstance": true,
+				"command": "cargo run",
+				"name": "run"
+			}, {
+				"useVsCodeApi": false,
+				"singleInstance": true,
+				"command": "cargo fmt --check",
+				"name": "ch-fmt"
+			}, {
+				"useVsCodeApi": false,
+				"singleInstance": true,
+				"command": "cargo check",
+				"name": "ch-check"
+			}]
+		}
+	}
+}
